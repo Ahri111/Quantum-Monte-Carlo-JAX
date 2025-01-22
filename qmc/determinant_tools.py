@@ -1,7 +1,7 @@
 import numpy as np
 import jax
 import jax.numpy as jnp
-from qmc.orbitals import Orbitals
+#from qmc.orbitals import Orbitals
 
 def jax_single_occupation_list(mf, weight=1.0):
     '''
