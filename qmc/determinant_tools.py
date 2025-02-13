@@ -1,8 +1,9 @@
 import numpy as np
 import jax
 import jax.numpy as jnp
-#from qmc.orbitals import Orbitals
+from typing import NamedTuple
 
+ 
 def jax_single_occupation_list(mf, weight=1.0):
     '''
     Jax version of single occupation list function.
@@ -12,7 +13,6 @@ def jax_single_occupation_list(mf, weight=1.0):
     
     try:
         mf = mf.to_uhf()
-    
     except TypeError:
         mf = mf.to_uhf(mf)
         
@@ -150,43 +150,70 @@ def organize_determinant_data(determinant_list, weight_threshold=0):
 
    return np.array(determinant_weights), orbital_patterns, np.array(pattern_mapping)
 
-# def determinants_from_pyscf(mol, mf, mc = None, tol = -1):
-#     periodic = hasattr(mol, "a")
-#     if mc is None:
-#         determinants = single_occupation_list(mf)
-#     elif periodic:
-#         pass
-#         #determinants = pbc_determinants_from_casci(mc, cutoff=tol)
+def binary_to_occ(S, ncore):
+    """
+    Converts the binary cistring for a given determinant
+    to occupation values for molecular orbitals within
+    the determinant.
+    """
+    occup = [int(i) for i in range(ncore)]
+    occup += [int(i + ncore) for i, c in enumerate(reversed(S)) if c == "1"]
+    max_orb = max(occup) if occup else 1
+    return (occup, max_orb)
 
-#     #if mc is not None and not periodic:
-#     #    determinants = interpret_ci(mc, tol)
-#     return determinants
+
+def reformat_binary_dets(deters, ncore=0, tol=0):
+    #f = lambda x: (binary_to_occ(x[1], ncore)[0], binary_to_occ(x[2], ncore)[0])
+    def f(x):
+        return (binary_to_occ(x[1], ncore)[0], binary_to_occ(x[2], ncore)[0])
+    return [(x[0], f(x)) for x in deters if np.abs(x[0]) > tol]
 
 
-def orbital_from_pyscf(
-    mol, mf, mc=None, twist=0, determinants=None, tol=None, eval_gto_precision=None
-):
-    
-    f_max_orb = lambda a: jnp.where(
-    a.size > 0,
-    jnp.max(a, initial=0) + 1,
-    0)
-    
-    try:
-        mf = mf.to_uhf()
-    except TypeError:
-        mf = mf.to_uhf(mf)
-        
-    if determinants is None:
-        determinants =  jax_single_occupation_list(mf)
-    
-    _mo_coeff = mf.mo_coeff
-    
-    max_orb = jnp.array([[f_max_orb(s) for s in det] for wt, det in determinants])
-    max_orb = jnp.amax(max_orb, axis=0)
-    mo_coeff = [_mo_coeff[spin][:, 0 : max_orb[spin]] for spin in [0, 1]]
-    evaluator = Orbitals(mol, mo_coeff)
-    
-    detcoeff, occup, det_map = jax_organize_determinant_data(determinants)
-    
-    return detcoeff, occup, det_map, evaluator
+def create_packed_objects(deters, tol=0):
+    """
+    if format == "binary":
+    deters is expected to be an iterable of tuples, each of which is
+    (weight, occupation string up, occupation_string down)
+    if format == "list"
+    (weight, occupation)
+    where occupation is a nested list [s][0, 1, 2, 3 ..], for example.
+
+    ncore should be the number of core orbitals not included in the occupation strings.
+    tol is the threshold at which to include the determinants
+
+    :returns:
+        * detwt: array of weights for each determinant
+        * occup: which orbitals go in which determinants
+        * map_dets: given a determinant in detwt, which determinant in occup it corresponds to
+    """
+    # Create map and occupation objects
+    detwt = []
+    map_dets = [[], []]
+    occup = [[], []]
+    for x in deters:
+        if np.abs(x[0]) > tol:
+            detwt.append(x[0])
+            spin_occ = x[1]
+            for s in [0, 1]:
+                if spin_occ[s] not in occup[s]:
+                    map_dets[s].append(len(occup[s]))
+                    occup[s].append(spin_occ[s])
+                else:
+                    map_dets[s].append(occup[s].index(spin_occ[s]))
+
+    return np.array(detwt), occup, np.array(map_dets)
+
+def flatten_determinants(determinants, max_orb, kinds):
+    """
+    The determinant indices are flattened so that the indices refer to the concatenated MO coefficients.
+    """
+    determinants_flat = []
+    orb_offsets = np.cumsum(max_orb[:, kinds], axis=1)
+    orb_offsets = np.pad(orb_offsets[:, :-1], ((0, 0), (1, 0)))
+    for wt, det in determinants:
+        flattened_det = []
+        for det_s, offset_s in zip(det, orb_offsets):
+            detlist = [det_s[k] + offset_s[ki] for ki, k in enumerate(kinds)]
+            flattened_det.append(list(np.concatenate(detlist).flatten().astype(int)))
+        determinants_flat.append((wt, flattened_det))
+    return determinants_flat

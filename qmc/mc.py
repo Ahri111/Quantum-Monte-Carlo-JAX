@@ -35,5 +35,3 @@ def np_initial_guess(mol, nconfig, r = 1.0):
         epos += r * np.random.randn(*epos.shape)
         
         return epos
-    
-    
