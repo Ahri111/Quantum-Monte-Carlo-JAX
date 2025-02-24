@@ -71,7 +71,6 @@ for _ in range(equilibration_step):
         t_prob = np.exp(1 / (2 * tstep) * (forward - backward))
         ratio = np.abs(new_val) ** 2 * t_prob
         accept = ratio > np.random.rand(nconf)
-        print(accept)
         # Update wave function
         configs.move(e, newcoorde, accept)
         wf.updateinternals(e, newcoorde, configs, mask=accept, saved_values=saved)
