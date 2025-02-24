@@ -30,7 +30,7 @@ def mol_eval_gto(mol, evalstr: str, walker: np.ndarray) -> np.ndarray:
     
     return aos
 
-def aos(mol, eval_str, configs, mask = None) -> jnp.numpy.ndarray:
+def aos(mol, eval_str, configs, mask = None) -> jnp.ndarray:
     '''
     Evaluate atomic orbitals at given configurations.
     
@@ -80,32 +80,19 @@ def mos(ao: jnp.ndarray, parameters) -> jnp.ndarray:
     '''
     return jnp.dot(ao[0], parameters)
 
-
-def orbital_from_pyscf(
-    mol, mf, mc=None, twist=0, determinants=None, tol=None, eval_gto_precision=None
-):
-    
-    _nelec = mol.nelec
-    
-    f_max_orb = lambda a: jnp.where(
-    a.size > 0,
-    jnp.max(a, initial=0) + 1,
-    0)
-    
-    try:
-        mf = mf.to_uhf()
-    except TypeError:
-        mf = mf.to_uhf(mf)
-    
-    if determinants is None:
-        determinants =  jax_single_occupation_list(mf)
-    
-    _mo_coeff = mf.mo_coeff
-    
-    max_orb = jnp.array([[f_max_orb(s) for s in det] for wt, det in determinants])
-    max_orb = jnp.amax(max_orb, axis=0)
-    mo_coeff = [_mo_coeff[spin][:, 0 : max_orb[spin]] for spin in [0, 1]]
-    
-    detcoeff, occup, det_map = jax_organize_determinant_data(determinants)
-    
-    return max_orb, mo_coeff, detcoeff, occup, det_map, _nelec
+def check_parameters_complex(*params):
+    """
+    Check whether detcoeff and mo_coeff are complex
+        
+    Args:
+        *params: param1: mo_coeff, param2 : det_coeff
+        
+    Returns 1 if complex, 0 if not
+    """
+    # 각 파라미터를 평탄화하고 연결
+    flattened = [param.ravel() for param in params if param is not None]
+    if not flattened:  # 빈 입력 체크
+        return False
+        
+    combined = jnp.concatenate(flattened)
+    return bool(jnp.iscomplex(combined).any())

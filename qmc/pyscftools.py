@@ -7,7 +7,8 @@ import json
 import numpy as np
 import jax
 import jax.numpy as jnp
-from typing import NamedTuple
+from typing import NamedTuple, Tuple, Any
+from pyscf import gto, scf, mcscf
 
 from qmc.determinant_tools import flatten_determinants
 from qmc.determinant_tools import create_packed_objects
@@ -250,3 +251,50 @@ def deters_from_hci(mc, tol):
         s2 = "".join(str(bin(p)).replace("0b", "") for p in s[nstrs:])
         deters.append((c, s1, s2))
     return deters
+
+def initialize_calculation(mol: gto.Mole, nconfig: int) -> Tuple:
+    """계산에 필요한 초기 설정을 수행합니다.
+    
+    Args:
+        mol: 분자 객체
+        nconfig: 설정 개수
+        
+    Returns:
+        coords, max_orb, det_coeff, det_map, mo_coeff, occup_hash, nelec
+    """
+    # Hartree-Fock 계산 수행
+    mf = scf.RHF(mol)
+    mf.kernel()
+    
+    # 초기 설정 생성
+    configs = pyq.initial_guess(mol, nconfig)
+    coords = configs.configs
+    
+    # 궤도함수 평가자 설정
+    max_orb, det_coeff, det_map, mo_coeff, occup_hash, _nelec = \
+        orbital_evaluator_from_pyscf(mol, mf)
+    
+    nelec = np.sum(mol.nelec)
+    return coords, max_orb, det_coeff, det_map, mo_coeff, occup_hash, nelec
+
+def determine_complex_settings(mo_coeff: jnp.ndarray, 
+                             det_coeff: jnp.ndarray) -> Tuple[bool, Any, Any]:
+    """복소수 관련 설정을 결정합니다.
+    
+    Args:
+        mo_coeff: 분자 궤도함수 계수
+        det_coeff: 결정자 계수
+        
+    Returns:
+        iscomplex, mo_dtype, get_phase
+    """
+    ao_dtype = float
+    # 초기 복소수 검사
+    iscomplex = check_parameters_complex(mo_coeff)
+    mo_dtype = complex if iscomplex else float
+    
+    # 최종 복소수 검사
+    iscomplex = mo_dtype == complex or check_parameters_complex(det_coeff, mo_coeff)
+    get_phase = get_complex_phase if iscomplex else jnp.sign
+    
+    return iscomplex, mo_dtype, get_phase

@@ -1,5 +1,6 @@
 import jax.numpy as jnp
 import numpy as np
+from qmc.determinants import gradient_laplacian
 
 def ee_energy(configs):
     """
@@ -90,3 +91,34 @@ def compute_potential_energy(mol, configs):
         'total': ee + ei + ii
     }
     return potential_components
+
+
+def kinetic_energy(configs, mol, dets, inverse, mo_coeff, det_coeff, det_map, _nelec, occup_hash):
+    """
+    운동에너지 계산
+    
+    Parameters
+    ----------
+    configs : jnp.ndarray
+        전자 configurations
+    기타 parameters는 gradient_laplacian과 동일
+    
+    Returns
+    -------
+    Tuple[jnp.ndarray, jnp.ndarray]
+        (kinetic_energy, gradient_squared)
+    """
+    nconf = configs.shape[0]
+    ke = jnp.zeros(nconf)
+    grad2 = jnp.zeros(nconf)
+    for e in range(configs.shape[1]):
+        grad, lap = gradient_laplacian(mol, e, configs[:, e, :], dets, inverse, 
+                                       mo_coeff, det_coeff, det_map, _nelec, occup_hash)
+
+        # -1/2 ∇²Ψ/Ψ
+        ke += -0.5 * jnp.real(lap)
+        
+        # gradient culmulation
+        grad2 += jnp.sum(jnp.abs(grad)**2, axis=0)
+    
+    return ke, grad2
