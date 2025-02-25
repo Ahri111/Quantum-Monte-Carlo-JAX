@@ -40,9 +40,9 @@ def recompute(mol, configs, mo_coeff, _nelec, occup_hash):
     
     return (updets, dndets), (upinverse, dninverse), aovals
 
+@partial(jax.jit, static_argnums=(2, 3))
 def compute_wf_value(configs, dets, det_coeff, det_map):
     
-    det_coeff = jnp.array([1.0]) if det_coeff is None else det_coeff
     updets, dndets = dets
     updets, dndets = updets[:, :, det_map[0]], dndets[:, :, det_map[1]]
     
