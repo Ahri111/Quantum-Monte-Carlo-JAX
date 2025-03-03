@@ -1,8 +1,9 @@
+import jax
 import jax.numpy as jnp
 import numpy as np
 from qmc.determinants import gradient_laplacian
 
-def ee_energy(configs):
+def jax_ee_energy(configs):
     """
     Calculate electron-electron Coulomb interaction energy (1/r).
     Mathematical form: V_ee = Σ_i<j (1/|r_i - r_j|)
@@ -19,7 +20,7 @@ def ee_energy(configs):
     ee = jnp.where(mask, 1.0 / r_ee_dist, 0.0)
     return jnp.sum(ee, axis=(1,2)) * 0.5
 
-def ei_energy(mol, configs):
+def jax_ei_energy(mol, configs):
     """
     Calculate electron-ion Coulomb interaction energy.
     Mathematical form: V_ei = -Σ_i Σ_A (Z_A/|r_i - R_A|)
@@ -57,7 +58,7 @@ def dist_matrix(configs):
     vs = jnp.concatenate(vs, axis=1)
     return vs, ij
 
-def ii_energy(mol):
+def jax_ii_energy(mol):
     """
     Calculate ion-ion Coulomb interaction energy.
     Mathematical form: V_ii = Σ_A<B (Z_A Z_B/|R_A - R_B|)
@@ -81,9 +82,9 @@ def compute_potential_energy(mol, configs):
     
     JIT application possible if component functions are pure operations.
     """
-    ee = ee_energy(configs)
-    ei = ei_energy(mol, configs)
-    ii = ii_energy(mol)
+    ee = jax_ee_energy(configs)
+    ei = jax_ei_energy(mol, configs)
+    ii = jax_ii_energy(mol)
     potential_components = {
         'ee': ee,
         'ei': ei,
@@ -100,8 +101,7 @@ def kinetic_energy(configs, mol, dets, inverse, mo_coeff, det_coeff, det_map, _n
     Parameters
     ----------
     configs : jnp.ndarray
-        전자 configurations
-    기타 parameters는 gradient_laplacian과 동일
+    configurations
     
     Returns
     -------
@@ -121,4 +121,26 @@ def kinetic_energy(configs, mol, dets, inverse, mo_coeff, det_coeff, det_map, _n
         # gradient culmulation
         grad2 += jnp.sum(jnp.abs(grad)**2, axis=0)
     
+    return ke, grad2
+
+def kinetic_energy_vmap(configs, mol, dets, inverse, mo_coeff, det_coeff, det_map, _nelec, occup_hash):
+    """
+    운동에너지 계산 (벡터화 최적화)
+    """
+    nconf = configs.shape[0]
+
+    def single_electron_ke(e):
+        grad, lap = gradient_laplacian(mol, e, configs[:, e, :], dets, inverse, 
+                                       mo_coeff, det_coeff, det_map, _nelec, occup_hash)
+        ke_e = -0.5 * jnp.real(lap)
+        grad2_e = jnp.sum(jnp.abs(grad)**2, axis=0)
+        return ke_e, grad2_e
+
+    # vmap을 사용하여 모든 전자에 대해 동시에 연산
+    ke_all, grad2_all = jax.vmap(single_electron_ke)(jnp.arange(configs.shape[1], dtype=jnp.int32))
+
+    # 모든 전자의 결과를 합산
+    ke = jnp.sum(ke_all, axis=0)
+    grad2 = jnp.sum(grad2_all, axis=0)
+
     return ke, grad2

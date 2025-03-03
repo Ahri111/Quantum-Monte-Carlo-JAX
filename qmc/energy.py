@@ -2,7 +2,7 @@ import jax.numpy as jnp
 import numpy as np
 from qmc.determinants import gradient_laplacian
 
-def ee_energy(configs):
+def jax_ee_energy(configs):
     """
     Calculate electron-electron Coulomb interaction energy (1/r).
     Mathematical form: V_ee = Σ_i<j (1/|r_i - r_j|)
@@ -19,7 +19,7 @@ def ee_energy(configs):
     ee = jnp.where(mask, 1.0 / r_ee_dist, 0.0)
     return jnp.sum(ee, axis=(1,2)) * 0.5
 
-def ei_energy(mol, configs):
+def jax_ei_energy(mol, configs):
     """
     Calculate electron-ion Coulomb interaction energy.
     Mathematical form: V_ei = -Σ_i Σ_A (Z_A/|r_i - R_A|)
@@ -57,7 +57,7 @@ def dist_matrix(configs):
     vs = jnp.concatenate(vs, axis=1)
     return vs, ij
 
-def ii_energy(mol):
+def jax_ii_energy(mol):
     """
     Calculate ion-ion Coulomb interaction energy.
     Mathematical form: V_ii = Σ_A<B (Z_A Z_B/|R_A - R_B|)
@@ -93,21 +93,8 @@ def compute_potential_energy(mol, configs):
     return potential_components
 
 
-def kinetic_energy(configs, mol, dets, inverse, mo_coeff, det_coeff, det_map, _nelec, occup_hash):
-    """
-    운동에너지 계산
+def jax_kinetic_energy(configs, mol, dets, inverse, mo_coeff, det_coeff, det_map, _nelec, occup_hash):
     
-    Parameters
-    ----------
-    configs : jnp.ndarray
-        전자 configurations
-    기타 parameters는 gradient_laplacian과 동일
-    
-    Returns
-    -------
-    Tuple[jnp.ndarray, jnp.ndarray]
-        (kinetic_energy, gradient_squared)
-    """
     nconf = configs.shape[0]
     ke = jnp.zeros(nconf)
     grad2 = jnp.zeros(nconf)
