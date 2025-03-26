@@ -1,6 +1,6 @@
 import jax
 import jax.numpy as jnp
-import jax.random as jrand
+from jax import random
 
 from typing import Tuple, Optional
 
@@ -10,6 +10,7 @@ import pyqmc.api as pyq
 from qmc.pyscftools import  orbital_evaluator_from_pyscf
 from qmc.orbitals import *
 from qmc.determinants import *
+from qmc.extract import jax_ee_energy, jax_ei_energy, jax_ii_energy, compute_potential_energy, jax_kinetic_energy
 
 @jax.jit
 def limdrift(g, cutoff=1):
@@ -25,193 +26,345 @@ def limdrift(g, cutoff=1):
     scaling = jnp.where(mask, cutoff / tot, 1.0)
     return g * scaling[:, jnp.newaxis]
 
-def metropolis_step(e, carry, mol, mo_coeff, det_coeff, det_map, _nelec, occup_hash, tstep, get_phase):
-    """
-    Performs a Metropolis step for a single electron.
-    
-    This function stochastically updates the position of electron e in a quantum Monte Carlo 
-    simulation. It uses the Metropolis-Hastings algorithm to sample electron positions according 
-    to the probability distribution of the wavefunction squared.
-    
-    :parameter e: Index of the electron being processed
-    :parameter carry: Tuple of state variables (coords, aovals, dets, inverse, key, acc)
-        coords: Positions of all electrons [nconf, nelec, 3]
-        aovals: Atomic orbital values
-        dets: Slater determinant values
-        inverse: Inverse of the Slater matrices
-        key: JAX random number generator key
-        acc: Accumulated acceptance ratio
-    :parameter mol: Molecule information (PySCF mol object)
-    :parameter mo_coeff: Molecular orbital coefficients
-    :parameter det_coeff: Determinant coefficients
-    :parameter det_map: Determinant mapping
-    :parameter _nelec: Electron count information (total electrons, alpha electrons, beta electrons)
-    :parameter occup_hash: Occupation hash
-    :parameter tstep: Time step parameter controlling the magnitude of moves
-    :parameter get_phase: Function to calculate the phase of Slater determinants
-    
-    :returns: Updated tuple of state variables (coords, aovals, dets, inverse, key, acc)
-    """
-    coords, aovals, dets, inverse, key, acc = carry
-    nconf = coords.shape[0]  # Number of configurations
-    
-    # The gradient_value function likely uses mol, so we can't JIT across this boundary
-    g, _, _ = gradient_value(mol, e, coords[:, e, :], dets, inverse, mo_coeff, 
-                           det_coeff, det_map, _nelec, occup_hash)
-    
-    # This part doesn't use mol directly, so we could JIT it separately
-    grad, key, newcoorde, gauss = _metropolis_compute(
-        g, coords, e, key, tstep, nconf)
-    
-    # The gradient_value call again uses mol
-    g, new_val, saved = gradient_value(mol, e, newcoorde, dets, inverse, mo_coeff, 
-                                     det_coeff, det_map, _nelec, occup_hash)
-    
-    # This part could be another JIT-compiled function
-    new_grad, t_prob, ratio, key, accept, acc, indices, coords = _metropolis_decision(
-        g, newcoorde, new_val, coords, gauss, grad, tstep, e, key, nconf, _nelec[0])
-    
-    # Sherman-Morrison update likely involves mol, so keep outside JIT
-    aovals, dets, inverse = sherman_morrison(e, newcoorde, coords, mask=accept, 
-                                           aovals=aovals, saved_value=saved, 
-                                           get_phase=get_phase, dets=dets, 
-                                           inverse=inverse, mo_coeff=mo_coeff, 
-                                           occup_hash=occup_hash, _nelec=_nelec)
-    
-    return coords, aovals, dets, inverse, key, acc
-
-
-# JIT-compiled helper functions for the parts that don't use mol
 @jax.jit
-def _metropolis_compute(g, coords, e, key, tstep, nconf):
-    """Computes the gradient drift and proposed move (JIT-compatible part)"""
-    grad = limdrift(jnp.real(g.T))
+def compute_transition_probability(gauss, grad, new_grad, tstep):
+    """
+    Compute the transition probability ratio for the Metropolis-Hastings algorithm.
     
-    key, subkey = jrand.split(key)
-    gauss = jrand.normal(subkey, shape=(nconf, 3)) * jnp.sqrt(tstep)
+    Parameters:
+    gauss: Gaussian random displacement
+    grad: Current position gradient
+    new_grad: Proposed position gradient
+    tstep: Time step size
     
-    newcoorde = coords[:, e, :] + gauss + grad * tstep
-    
-    return grad, key, newcoorde, gauss
-
-
-@jax.jit
-def _metropolis_decision(g, newcoorde, new_val, coords, gauss, grad, tstep, e, key, nconf, nelec_total):
-    """Computes the acceptance ratio and makes the decision (JIT-compatible part)"""
-    new_grad = limdrift(jnp.real(g.T))
-    
+    Returns:
+    Transition probability ratio
+    """
     forward = jnp.sum(gauss**2, axis=1)
     backward = jnp.sum((gauss + tstep * (grad + new_grad))**2, axis=1)
     t_prob = jnp.exp(1 / (2 * tstep) * (forward - backward))
-    
-    ratio = jnp.abs(new_val) ** 2 * t_prob
-    
-    key, subkey = jrand.split(key)
-    accept = ratio > jrand.uniform(subkey, shape=(nconf,))
-    
-    acc = jnp.mean(accept) / nelec_total
-    
-    indices = jnp.where(accept)[0]
-    coords = coords.at[indices, e, :].set(newcoorde[indices, :])
-    
-    return new_grad, t_prob, ratio, key, accept, acc, indices, coords
-
-
-
+    return t_prob
 
 @jax.jit
-def run_equilibration_step(i, carry, mol, mo_coeff, det_coeff, det_map, _nelec, occup_hash, nelec, tstep, get_phase):
+def update_coordinates(coords, e, accept, newcoorde):
     """
-    Performs a single equilibration step by updating all electrons once.
-    
-    This function applies the Metropolis algorithm to each electron in sequence,
-    completing one full sweep through all electrons in the system.
-    
-    :parameter i: Current equilibration step index
-    :parameter carry: Tuple of state variables (coords, aovals, dets, inverse, key, total_acc)
-        coords: Positions of all electrons [nconf, nelec, 3]
-        aovals: Atomic orbital values
-        dets: Slater determinant values
-        inverse: Inverse of the Slater matrices
-        key: JAX random number generator key
-        total_acc: Total accumulated acceptance ratio
-    :parameter mol: Molecule information
-    :parameter mo_coeff: Molecular orbital coefficients
-    :parameter det_coeff: Determinant coefficients
-    :parameter det_map: Determinant mapping
-    :parameter _nelec: Electron count information (total electrons, alpha electrons, beta electrons)
-    :parameter occup_hash: Occupation hash
-    :parameter nelec: Number of electrons
-    :parameter tstep: Time step parameter controlling the magnitude of moves
-    :parameter get_phase: Function to calculate the phase of Slater determinants
-    
-    :returns: Updated tuple of state variables (coords, aovals, dets, inverse, key, total_acc)
+    Update the electron coordinates based on acceptance using JAX-friendly operations.
     """
-    coords, aovals, dets, inverse, key, total_acc = carry
+    # Create a condition array that's True only for the accepted moves of electron e
+    # We'll use broadcasting to make a 3D mask matching coords dimensions
+    mask = jnp.zeros_like(coords, dtype=bool)
+    mask = mask.at[:, e, :].set(accept[:, None])  # Broadcast accept across coordinates
     
-    # Initialize acceptance ratio for this step
-    acc = 0.0
+    # Create the updated array with new coordinates for electron e
+    new_coords = coords.at[:, e, :].set(newcoorde)
     
-    # Define a function for metropolis_step with fixed parameters except electron index
-    def step_fn(e, carry):
-        return metropolis_step(e, carry, mol, mo_coeff, det_coeff, det_map, _nelec, 
-                              occup_hash, tstep, get_phase)
-    
-    # Apply metropolis step to all electrons using JAX's fori_loop
-    coords, aovals, dets, inverse, key, acc = jax.lax.fori_loop(
-        0, nelec, step_fn, (coords, aovals, dets, inverse, key, acc))
-    
-    # Update total acceptance ratio
-    total_acc = total_acc + acc
-    
-    return coords, aovals, dets, inverse, key, total_acc
+    # Use where to conditionally select between original and new coordinates
+    return jnp.where(mask, new_coords, coords)
 
-@jax.jit
-def run_simulation(coords, aovals, dets, inverse, key, mol, mo_coeff, det_coeff, det_map, _nelec, occup_hash, nelec, equilibration_step, tstep, get_phase):
+# # Main simulation function that uses the JIT-compiled subfunctions
+def mc_simulation(coords, mol, mo_coeff, det_coeff, det_map, _nelec, occup_hash,
+                     get_phase, key, equilibration_step=500, tstep=0.5):
     """
-    Runs a complete quantum Monte Carlo simulation with equilibration.
+    Run a quantum Monte Carlo simulation using regular Python loops with JIT-compiled subfunctions.
     
-    This function performs multiple equilibration steps to sample electron configurations
-    according to the wavefunction probability distribution. Each equilibration step
-    updates all electrons once.
+    Parameters:
+    coords: Initial electron coordinates [nconf, nelec, 3]
+    mol: PySCF molecule object (cannot be used in JIT-compiled functions)
+    mo_coeff: Molecular orbital coefficients
+    det_coeff: Determinant coefficients
+    det_map: Determinant mapping
+    _nelec: Electron count information
+    occup_hash: Occupation hash
+    get_phase: Function to calculate the phase
+    equilibration_step: Number of equilibration steps
+    tstep: Time step size
+    seed: Random seed
     
-    :parameter coords: Initial electron positions [nconf, nelec, 3]
-    :parameter aovals: Initial atomic orbital values
-    :parameter dets: Initial Slater determinant values
-    :parameter inverse: Initial inverse of the Slater matrices
-    :parameter key: JAX random number generator key
-    :parameter mol: Molecule information
-    :parameter mo_coeff: Molecular orbital coefficients
-    :parameter det_coeff: Determinant coefficients
-    :parameter det_map: Determinant mapping
-    :parameter _nelec: Electron count information (total electrons, alpha electrons, beta electrons)
-    :parameter occup_hash: Occupation hash
-    :parameter nelec: Number of electrons
-    :parameter equilibration_step: Number of equilibration steps to perform
-    :parameter tstep: Time step parameter controlling the magnitude of moves
-    :parameter get_phase: Function to calculate the phase of Slater determinants
-    
-    :returns: Tuple containing updated electron configurations, wavefunction values, and average acceptance ratio
-        coords: Final electron positions
-        aovals: Final atomic orbital values
-        dets: Final Slater determinant values
-        inverse: Final inverse of the Slater matrices
-        key: Updated JAX random number generator key
-        avg_acc: Average acceptance ratio across all equilibration steps
+    Returns:
+    Final coordinates, acceptance ratio, and elapsed time
     """
-    # Initialize acceptance ratio
+    nconf, nelec, _ = coords.shape
+    
+    # Initialize wavefunction values
+    aovals, dets, inverse = recompute(mol, coords, mo_coeff, _nelec, occup_hash)
+    
+    # Set random seed for reproducibility    
     total_acc = 0.0
     
-    # Define a function for run_equilibration_step with fixed parameters except step index
-    def equil_fn(i, carry):
-        return run_equilibration_step(i, carry, mol, mo_coeff, det_coeff, det_map, _nelec, 
-                                     occup_hash, nelec, tstep, get_phase)
+    # Main simulation loop
+    for i in range(equilibration_step):
+        step_acc = 0.0
+        
+        # Update each electron
+        for e in range(nelec):
+            
+            key, gauss_key = random.split(key)
+            
+            # Calculate gradient at current position (uses mol, can't be JIT-compiled)
+            g, _, _ = gradient_value(mol, e, coords[:, e, :], dets, inverse, mo_coeff,
+                                    det_coeff, det_map, _nelec, occup_hash)
+            
+            # Apply drift limitation (JIT-compiled)
+            grad = limdrift(jnp.real(g.T))
+            
+            # Generate random displacement
+            # gauss = np.random.normal(scale=np.sqrt(tstep), size=(nconf, 3))
+            # gauss = jnp.array(gauss)
+            gauss = random.normal(gauss_key, shape = (nconf, 3)) * jnp.sqrt(tstep)
+            
+            # Propose new position
+            newcoorde = coords[:, e, :] + gauss + grad * tstep
+            
+            # Calculate gradient at proposed position (uses mol, can't be JIT-compiled)
+            g, new_val, saved = gradient_value(mol, e, newcoorde, dets, inverse, mo_coeff,
+                                             det_coeff, det_map, _nelec, occup_hash)
+            
+            # Apply drift limitation to new gradient (JIT-compiled)
+            new_grad = limdrift(jnp.real(g.T))
+            
+            # Compute transition probability (JIT-compiled)
+            t_prob = compute_transition_probability(gauss, grad, new_grad, tstep)
+            
+            # Calculate acceptance ratio
+            ratio = jnp.abs(new_val) ** 2 * t_prob
+            
+            # Metropolis acceptance/rejection
+            key, uniform_key = random.split(key)
+            uniform_rand = random.uniform(uniform_key, shape=(nconf,))
+            accept = ratio > uniform_rand
+            # accept = ratio > np.random.rand(nconf)
+            
+            # Update coordinates for accepted moves (JIT-compiled)
+            coords = update_coordinates(coords, e, accept, newcoorde)
+            
+            # Update wavefunction values (uses mol, can't be JIT-compiled)
+            aovals, dets, inverse = sherman_morrison(e, newcoorde, coords, accept, aovals, 
+                                                     saved, get_phase, dets, inverse, 
+                                                     mo_coeff, occup_hash, _nelec)
+            
+            # Update acceptance counter
+            step_acc += jnp.mean(accept) / nelec
+        
+        # Track average acceptance
+        total_acc += step_acc / equilibration_step
     
-    # Execute all equilibration steps using JAX's fori_loop
-    coords, aovals, dets, inverse, key, total_acc = jax.lax.fori_loop(
-        0, equilibration_step, equil_fn, (coords, aovals, dets, inverse, key, total_acc))
+    return coords, total_acc
+
+
+def jax_energy_mc_simulation(coords, mol, mo_coeff, det_coeff, det_map, _nelec, occup_hash,
+                             get_phase, key, equilibration_step=500, tstep=0.5):
+    """
+    Run a quantum Monte Carlo simulation using regular Python loops with JIT-compiled subfunctions.
     
-    # Calculate average acceptance ratio
-    avg_acc = total_acc / equilibration_step
+    Parameters:
+    coords: Initial electron coordinates [nconf, nelec, 3]
+    mol: PySCF molecule object (cannot be used in JIT-compiled functions)
+    mo_coeff: Molecular orbital coefficients
+    det_coeff: Determinant coefficients
+    det_map: Determinant mapping
+    _nelec: Electron count information
+    occup_hash: Occupation hash
+    get_phase: Function to calculate the phase
+    equilibration_step: Number of equilibration steps
+    tstep: Time step size
+    seed: Random seed
     
-    return coords, aovals, dets, inverse, key, avg_acc
+    Returns:
+    Final coordinates, acceptance ratio, and elapsed time
+    """
+    nconf, nelec, _ = coords.shape
+    atom_coords = jnp.array(mol.atom_coords())
+    atom_charges = jnp.array(mol.atom_charges())    
+    # Initialize wavefunction values
+    aovals, dets, inverse = recompute(mol, coords, mo_coeff, _nelec, occup_hash)
+    
+    total_acc = 0.0
+    ee_total = 0.0
+    ei_total = 0.0
+    ke_total = 0.0
+    ii_total = 0.0
+    te_total = 0.0
+    # Main simulation loop
+    for i in range(equilibration_step):
+        step_acc = 0.0
+        
+        # Update each electron
+        for e in range(nelec):
+            
+            key, gauss_key = random.split(key)
+
+            # Calculate gradient at current position (uses mol, can't be JIT-compiled)
+            g, _, _ = gradient_value(mol, e, coords[:, e, :], dets, inverse, mo_coeff,
+                                    det_coeff, det_map, _nelec, occup_hash)
+            
+            # Apply drift limitation (JIT-compiled)
+            grad = limdrift(jnp.real(g.T))
+            
+            # Generate random displacement
+            # gauss = np.random.normal(scale=np.sqrt(tstep), size=(nconf, 3))
+            # gauss = jnp.array(gauss)
+            gauss = random.normal(gauss_key, shape = (nconf, 3)) * jnp.sqrt(tstep)
+    
+            # Propose new position
+            newcoorde = coords[:, e, :] + gauss + grad * tstep
+            
+            # Calculate gradient at proposed position (uses mol, can't be JIT-compiled)
+            g, new_val, saved = gradient_value(mol, e, newcoorde, dets, inverse, mo_coeff,
+                                             det_coeff, det_map, _nelec, occup_hash)
+            
+            # Apply drift limitation to new gradient (JIT-compiled)
+            new_grad = limdrift(jnp.real(g.T))
+            
+            # Compute transition probability (JIT-compiled)
+            t_prob = compute_transition_probability(gauss, grad, new_grad, tstep)
+            
+            # Calculate acceptance ratio
+            ratio = jnp.abs(new_val) ** 2 * t_prob
+            
+            # Metropolis acceptance/rejection
+            key, uniform_key = random.split(key)
+            uniform_rand = random.uniform(uniform_key, shape=(nconf,))
+            accept = ratio > uniform_rand
+            # accept = ratio > np.random.rand(nconf)
+            
+            # Update coordinates for accepted moves (JIT-compiled)
+            coords = update_coordinates(coords, e, accept, newcoorde)
+            
+            # Update wavefunction values (uses mol, can't be JIT-compiled)
+            aovals, dets, inverse = sherman_morrison(e, newcoorde, coords, accept, aovals, 
+                                                   saved, get_phase, dets, inverse, 
+                                                   mo_coeff, occup_hash, _nelec)
+            
+            # Update acceptance counter
+            step_acc += jnp.mean(accept) / nelec
+        
+        # Track average acceptance
+        total_acc += step_acc / equilibration_step
+        
+    #     # ie = jnp.mean(ei_energy)
+    #     ee_current =  jnp.mean(jax_ee_energy(coords), axis = 0)
+    #     ei_current = jnp.mean(jax_ei_energy(coords, atom_charges, atom_coords), axis = 0)
+    #     ii_current = jax_ii_energy(mol)
+    #     ke_current = jnp.mean(jax_kinetic_energy(coords, mol, dets, inverse, mo_coeff, det_coeff, det_map, _nelec, occup_hash)[0], axis = 0)
+        
+    #     ee_total += ee_current / equilibration_step
+    #     ei_total += ei_current / equilibration_step
+    #     ke_total += ke_current / equilibration_step
+    #     ii_total += ii_current / equilibration_step
+        
+    # te_total = ee_total + ei_total + ke_total + ii_total
+    
+    return coords, te_total, total_acc
+
+def jax_energy_mc_wo_LG_simulation(coords, mol, mo_coeff, det_coeff, det_map, _nelec, occup_hash,
+                                   get_phase, key, equilibration_step=500, tstep=0.5):
+    """
+    Run a quantum Monte Carlo simulation using regular Python loops with JIT-compiled subfunctions.
+    
+    Parameters:
+    coords: Initial electron coordinates [nconf, nelec, 3]
+    mol: PySCF molecule object (cannot be used in JIT-compiled functions)
+    mo_coeff: Molecular orbital coefficients
+    det_coeff: Determinant coefficients
+    det_map: Determinant mapping
+    _nelec: Electron count information
+    occup_hash: Occupation hash
+    get_phase: Function to calculate the phase
+    equilibration_step: Number of equilibration steps
+    tstep: Time step size
+    seed: Random seed
+    
+    Returns:
+    Final coordinates, acceptance ratio, and elapsed time
+    """
+    nconf, nelec, _ = coords.shape
+    atom_coords = jnp.array(mol.atom_coords())
+    atom_charges = jnp.array(mol.atom_charges())    
+    # Initialize wavefunction values
+    aovals, dets, inverse = recompute(mol, coords, mo_coeff, _nelec, occup_hash)
+    
+    total_acc = 0.0
+    ee_total = 0.0
+    ei_total = 0.0
+    ke_total = 0.0
+    ii_total = 0.0
+    
+    # Main simulation loop
+    for i in range(equilibration_step):
+        step_acc = 0.0
+        
+        # Update each electron
+        for e in range(nelec):
+            
+            # Generate random displacement
+            key, gauss_key = random.split(key)
+            
+            gauss = random.normal(gauss_key, shape=(nconf, 3)) * jnp.sqrt(tstep)
+                        
+            # Calculate gradient at proposed position (uses mol, can't be JIT-compiled)
+            _, old_val, _ = gradient_value(mol, e, newcoorde, dets, inverse, mo_coeff,
+                                             det_coeff, det_map, _nelec, occup_hash)
+            
+            newcoorde = coords[:, e, :] + gauss
+
+            _, new_val, saved = gradient_value(mol, e, newcoorde, dets, inverse, mo_coeff,
+                                             det_coeff, det_map, _nelec, occup_hash)            
+            # Calculate acceptance ratio
+            ratio = jnp.abs(new_val) ** 2
+            
+            # Metropolis acceptance/rejection
+            key, uniform_key = random.split(key)
+            uniform_rand = random.uniform(uniform_key, shape=(nconf,))
+            accept = ratio > uniform_rand
+
+            # Update coordinates for accepted moves (JIT-compiled)
+            coords = update_coordinates(coords, e, accept, newcoorde)
+            
+            # Update wavefunction values (uses mol, can't be JIT-compiled)
+            aovals, dets, inverse = sherman_morrison(e, newcoorde, coords, accept, aovals, 
+                                                   saved, get_phase, dets, inverse, 
+                                                   mo_coeff, occup_hash, _nelec)
+            
+            # Update acceptance counter
+            step_acc += jnp.mean(accept) / nelec
+        
+        # Track average acceptance
+        total_acc += step_acc / equilibration_step
+        ee_current = jnp.mean(jax_ee_energy(coords), axis=0)
+        ei_current = jnp.mean(jax_ei_energy(coords, atom_charges, atom_coords), axis=0)
+        ii_current = jax_ii_energy(mol)
+        ke_current = jnp.mean(jax_kinetic_energy(coords, mol, dets, inverse, mo_coeff, det_coeff, det_map, _nelec, occup_hash)[0], axis=0)
+        
+        # Accumulate energy components for averaging
+        ee_total += ee_current / equilibration_step
+        ei_total += ei_current / equilibration_step
+        ke_total += ke_current / equilibration_step
+        ii_total += ii_current / equilibration_step
+     
+    te_total = ee_total + ei_total + ke_total + ii_total
+
+    return coords, te_total
+
+def vmc(
+   coords, 
+   mol, 
+   mo_coeff, 
+   det_coeff, 
+   det_map, 
+   _nelec, 
+   occup_hash,
+   get_phase, 
+   key, 
+   equilibration_step=500, 
+   tstep=0.5,
+   n_blocks = 10,
+   nsteps_per_block = 10,
+   blockoffset = 0,
+   mode = ""
+):
+    
+    block_energies = {
+        
+    }
+    
+
