@@ -93,7 +93,8 @@ class OrbitalEvaluatorResult(NamedTuple):
     detcoeff: jnp.ndarray
     det_map: jnp.ndarray
     mo_coeff: jnp.ndarray
-    occup: tuple
+    occup_hash: tuple
+    occup : list
     elec_n : tuple
            
 def orbital_evaluator_from_pyscf(
@@ -172,10 +173,10 @@ def orbital_evaluator_from_pyscf(
     mo_coeff = jnp.array(mo_coeff)
 
     elec_n = mol.nelec
-    occup = convert_to_hashable(occup)
+    occup_hash = convert_to_hashable(occup)
     
     return OrbitalEvaluatorResult(max_orb, detcoeff, det_map,
-                                  mo_coeff, occup, elec_n)
+                                  mo_coeff, occup_hash, occup, elec_n)
 
 def determinants_from_pyscf(mol, mf, mc=None, tol=-1):
     periodic = hasattr(mol, "a")
@@ -271,11 +272,11 @@ def initialize_calculation(mol: gto.Mole, nconfig: int) -> Tuple:
     coords = configs.configs
     
     # 궤도함수 평가자 설정
-    max_orb, det_coeff, det_map, mo_coeff, occup_hash, _nelec = \
+    max_orb, det_coeff, det_map, mo_coeff, occup_hash, occup, _nelec = \
         orbital_evaluator_from_pyscf(mol, mf)
     
     nelec = np.sum(mol.nelec)
-    return coords, max_orb, det_coeff, det_map, mo_coeff, occup_hash, nelec
+    return coords, max_orb, det_coeff, det_map, mo_coeff, occup_hash, occup, nelec
 
 def determine_complex_settings(mo_coeff: jnp.ndarray, 
                              det_coeff: jnp.ndarray) -> Tuple[bool, Any, Any]:

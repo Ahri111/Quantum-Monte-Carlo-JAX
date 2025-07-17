@@ -1,5 +1,6 @@
 import jax
 import jax.numpy as jnp
+import numpy as np
 from functools import partial
 from qmc.orbitals import aos
 from qmc.orbitals import mos
@@ -8,6 +9,13 @@ def convert_to_hashable(occup):
     
     up_orbs = tuple(occup[0])
     dn_orbs = tuple(occup[1])
+    
+    return (up_orbs, dn_orbs)
+
+def convert_to_numpy(occup):
+    
+    up_orbs = np.array(occup[0])
+    dn_orbs = np.array(occup[1])
     
     return (up_orbs, dn_orbs)
 
@@ -46,7 +54,7 @@ def recompute(mol, configs, mo_coeff, _nelec, occup_hash):
 
     return recompute_jit(aovals, mo_coeff, _nelec, occup_hash)
 
-@partial(jax.jit, static_argnums=(2, 3))
+@jax.jit
 def compute_wf_value(configs, dets, det_coeff, det_map):
     
     updets, dndets = dets
@@ -200,3 +208,105 @@ def sherman_morrison(e, epos, configs, mask, aovals, saved_value, get_phase, det
     dets = tuple(dets_list)
 
     return aovals, dets, inverse
+
+import jax
+import jax.numpy as jnp
+
+# JAX를 64비트 부동소수점으로 설정
+jax.config.update("jax_enable_x64", True)
+
+# einsum 연산만을 위한 JIT 컴파일된 함수
+@jax.jit
+def compute_col_derivative(ao_vals, inverse_slice):
+    """
+    원자 궤도함수 값과 역행렬 요소를 사용하여 열 파생값을 계산합니다.
+    
+    Args:
+        ao_vals: 원자 궤도함수 값 (shape: [nconf, nao, ...])
+        inverse_slice: 역행렬 요소 (shape: [nconf, nao, ...])
+        
+    Returns:
+        열 파생값 (shape: [nconf, ...])
+    """
+    return jnp.einsum(
+        "ij...,ij->i...", 
+        ao_vals, 
+        inverse_slice,
+        optimize="greedy"
+    )
+
+# 이제 메인 함수 내에서 JIT 컴파일된 함수 사용
+def parameter_gradient(configs, aovals, dets, det_coeff, mo_coeff, det_map, occup_hash, _nelec, inverse):
+    curr_val = compute_wf_value(configs, dets, det_coeff, det_map)
+    nonzero = curr_val[0] != 0.0
+    
+    # det_map에 따라 행렬식 매핑
+    dets_mapped = (
+        dets[0][:, :, det_map[0]],
+        dets[1][:, :, det_map[1]],
+    )
+    
+    # 행렬식 계수에 대한 미분 계산
+    d = {}
+    d["det_coeff"] = jnp.zeros(dets_mapped[0].shape[1:], dtype=dets_mapped[0].dtype)
+    d["det_coeff"] = d["det_coeff"].at[nonzero, :].set(
+        dets_mapped[0][0, nonzero, :]
+        * dets_mapped[1][0, nonzero, :]
+        * jnp.exp(
+            dets_mapped[0][1, nonzero, :]
+            + dets_mapped[1][1, nonzero, :]
+            - jnp.array(curr_val[1][nonzero, jnp.newaxis])
+        )
+        / jnp.array(curr_val[0][nonzero, jnp.newaxis])
+    )
+    
+    # 분자 궤도 계수에 대한 미분 계산
+    for s, parm in zip([0, 1], ["mo_coeff_alpha", "mo_coeff_beta"]):
+        ao = aovals[:, :, s * _nelec[0] : _nelec[s] + s * _nelec[0], :]
+        split = [mo_coeff[s].shape[1]]
+        aos = ao
+        mos = jnp.split(jnp.arange(split[-1]), jnp.asarray(split).astype(int))
+        
+        nao = aos[0].shape[-1]
+        nconf = aos[0].shape[0]
+        nmo = int(split[-1])
+        
+        deriv = jnp.zeros((len(occup_hash[s]), nconf, nao, nmo), dtype=curr_val[0].dtype)
+        
+        for det_idx in range(len(occup_hash[s])):
+            occ = occup_hash[s][det_idx]  # JAX 배열
+            
+            for ao_idx, (ao_vals, mo_indices) in enumerate(zip(aos, mos)):
+                for i in mo_indices:
+                    # JAX 배열에서 i가 있는지 확인
+                    is_in_occ = jnp.any(occ == i)
+                    
+                    if is_in_occ:
+                        # JAX에서 인덱스 찾기
+                        col = jnp.argmax(occ == i).item()  # 스칼라로 변환
+                        
+                        # JIT 컴파일된 einsum 함수 사용
+                        col_deriv = compute_col_derivative(
+                            ao_vals, 
+                            inverse[s][:, det_idx, col, :]
+                        )
+                        
+                        deriv = deriv.at[det_idx, :, :, i].set(col_deriv)
+        
+        # 행렬식에 대한 축소
+        d[parm] = jnp.zeros(deriv.shape[1:], dtype=curr_val[0].dtype)
+            
+        for di, coeff in enumerate(det_coeff):
+            whichdet = det_map[s][di]
+            d[parm] = d[parm] + (
+                deriv[whichdet]
+                * coeff
+                * d["det_coeff"][:, di, jnp.newaxis, jnp.newaxis]
+            )
+    
+    
+    for k in list(d.keys()):
+        if jnp.prod(jnp.array(d[k].shape)) == 0:
+            del d[k]
+            
+    return d

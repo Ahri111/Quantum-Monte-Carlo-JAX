@@ -24,11 +24,11 @@ def initialize_calculation(mol: gto.Mole, nconfig: int, seed):
     configs = pyq.initial_guess(mol, nconfig)
     coords = configs.configs
     
-    max_orb, det_coeff, det_map, mo_coeff, occup_hash, _nelec = \
+    max_orb, det_coeff, det_map, mo_coeff, occup_hash, occup, _nelec = \
         orbital_evaluator_from_pyscf(mol, mf)
     
     nelec = np.sum(mol.nelec)
-    return coords, max_orb, det_coeff, det_map, mo_coeff, occup_hash, _nelec, nelec
+    return coords, max_orb, det_coeff, det_map, mo_coeff, occup_hash, occup, _nelec, nelec
 
 def determine_complex_settings(mo_coeff: jnp.ndarray, 
                              det_coeff: jnp.ndarray):
