@@ -26,7 +26,6 @@ Case3.ipynb
 energy.py
 example.ipynb
 gradient_script.py
-gradients_script.ipynb
 graph_for_1.png
 graph_for_2png.png
 graph_for_10png.png
@@ -44,3 +43,7 @@ vmc_performance_analysis.png
 qmc/__pycache__
 qmc/.ipynb_checkpoints
 qmc/qmc.egg-info
+qmc/Lucas_1.png
+qmc/Lucas_2.png
+qmc/lucas.ipynb
+qmc/Lucas.png
